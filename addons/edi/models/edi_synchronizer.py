@@ -1,12 +1,29 @@
 """EDI synchronizer documents"""
 
 import logging
-from odoo import api, models
+from odoo import api, fields, models
 from odoo.tools.translate import _
 from odoo.osv import expression
 from ..tools import batched, Comparator
 
 _logger = logging.getLogger(__name__)
+
+
+class NoRecordValuesError(NotImplementedError):
+    """Method for constructing EDI record value dictionaries is not used
+
+    This exception can be raised by document models derived from
+    ``edi.document.sync`` to indicate that the method for constructing
+    EDI record value dictionaries has not been implemented and should
+    not be used.
+
+    This allows a record model derived from ``edi.record.sync`` to
+    identify situations in which the document model has chosen not to
+    use the convenience methods for constructing EDI record value
+    dictionaries, and so abandon the record preparation without any
+    side effects (such as deactivating any unmatched records).
+    """
+    pass
 
 
 class EdiSyncDocumentModel(models.AbstractModel):
@@ -30,6 +47,17 @@ class EdiSyncDocumentModel(models.AbstractModel):
     _name = 'edi.document.sync'
     _inherit = 'edi.document.model'
     _description = "EDI Synchronizer Document"
+
+    @api.model
+    def no_record_values(self):
+        """Indicate that this record value generator is not implemented
+
+        This method should be called by any empty placeholder
+        convenience methods for constructing EDI record value
+        dictionaries (such as are typically found in the base models
+        for an EDI synchronizer document type).
+        """
+        raise NoRecordValuesError
 
 
 class EdiSyncRecord(models.AbstractModel):
@@ -79,6 +107,18 @@ class EdiSyncRecord(models.AbstractModel):
     ]
 
     @api.model
+    def _setup_complete(self):
+        """Complete the model setup"""
+        super()._setup_complete()
+        cls = type(self)
+        domain = cls._edi_sync_domain
+        cls._edi_sync_domain = (
+            domain if callable(domain) else
+            (lambda self: domain) if domain else
+            (lambda self: [])
+        )
+
+    @api.model
     def targets_by_key(self, vlist):
         """Construct lookup cache of target records indexed by key field"""
         Target = self.browse()[self._edi_sync_target].with_context(
@@ -87,7 +127,7 @@ class EdiSyncRecord(models.AbstractModel):
         key = self._edi_sync_via
         targets = Target.search(expression.AND([
             [(key, 'in', [x['name'] for x in vlist])],
-            self._edi_sync_domain or []
+            self._edi_sync_domain()
         ]))
         return {k: v.ensure_one() for k, v in targets.groupby(key)}
 
@@ -138,37 +178,61 @@ class EdiSyncRecord(models.AbstractModel):
         from the document.
         """
 
+        # Get target model
+        Target = self.browse()[self._edi_sync_target]
+        matched_ids = set()
+
         # Construct comparator for target model
-        comparator = Comparator(self.browse()[self._edi_sync_target])
+        comparator = Comparator(Target)
 
-        # Process records in batches for efficiency
-        for r, vbatch in batched(vlist, self.BATCH_SIZE):
+        # Check for unimplemented values dictionary iterable
+        try:
 
-            _logger.info(_("%s preparing %s %d-%d"),
-                         doc.name, self._name, r[0], r[-1])
+            # Process records in batches for efficiency
+            for r, vbatch in batched(vlist, self.BATCH_SIZE):
 
-            # Add EDI lookup relationship target IDs where known
-            self._add_edi_relates_vlist(vbatch)
+                _logger.info(_("%s preparing %s %d-%d"),
+                             doc.name, self._name, r[0], r[-1])
 
-            # Look up existing target records
-            targets_by_key = self.targets_by_key(vbatch)
+                # Add EDI lookup relationship target IDs where known
+                self._add_edi_relates_vlist(vbatch)
 
-            # Create EDI records
-            for record_vals in vbatch:
+                # Look up existing target records
+                targets_by_key = self.targets_by_key(vbatch)
 
-                # Omit EDI records that would not change the target record
-                target = targets_by_key.get(record_vals['name'])
-                if target:
-                    target_vals = self.target_values(record_vals)
-                    if all(comparator[k](target[k], v)
-                           for k, v in target_vals.items()):
-                        continue
+                # Add to list of matched target record IDs
+                matched_ids |= set(x.id for x in targets_by_key.values())
 
-                # Create EDI record
-                record_vals['doc_id'] = doc.id
-                if target:
-                    record_vals[self._edi_sync_target] = target.id
-                self.create(record_vals)
+                # Create EDI records
+                for record_vals in vbatch:
+
+                    # Omit EDI records that would not change the target record
+                    target = targets_by_key.get(record_vals['name'])
+                    if target:
+                        target_vals = self.target_values(record_vals)
+                        if all(comparator[k](target[k], v)
+                               for k, v in target_vals.items()):
+                            continue
+
+                    # Create EDI record
+                    record_vals['doc_id'] = doc.id
+                    if target:
+                        record_vals[self._edi_sync_target] = target.id
+                    self.create(record_vals)
+
+        except NoRecordValuesError:
+            # Values dictionary iterable was not implemented (most
+            # likely because the document model has chosen not to use
+            # a convenience method): skip all further processing.
+            return
+
+        # Process all matched target records
+        self.matched(doc, Target.browse(matched_ids))
+
+    @api.model
+    def matched(self, _doc, _targets):
+        """Process matched target records"""
+        pass
 
     @api.multi
     def execute(self):
@@ -209,3 +273,81 @@ class EdiSyncRecord(models.AbstractModel):
             for rec in batch:
                 target_vals = rec.target_values(rec._record_values())
                 rec[target] = Target.create(target_vals)
+
+
+class EdiDeactivatorRecord(models.AbstractModel):
+    """EDI deactivator record
+
+    This is the base model for EDI records that simply deactivate
+    records in a target model.  Each row represents an Odoo record
+    that will be deactivated when the document is executed.
+
+    Derived models must override the comodel name for ``target_id``.
+    """
+
+    _edi_deactivator_name = 'name'
+    """EDI deactivator target name field
+
+    This is the name of the field within the target Odoo model used to
+    provide a name for the corresponding EDI record.  Defaults to
+    ``name``.
+    """
+
+    _name = 'edi.record.deactivator'
+    _inherit = 'edi.record'
+    _description = "EDI Deactivator Record"
+
+    target_id = fields.Many2one('_unknown', string="Target", required=True,
+                                readonly=True, index=True)
+
+    @api.model
+    def prepare(self, doc, targets):
+        """Prepare records
+
+        Accepts an EDI document ``doc`` and a list of target records
+        to be deactivated.
+        """
+        for target in targets:
+            self.create({
+                'doc_id': doc.id,
+                'target_id': target.id,
+                'name': target[self._edi_deactivator_name],
+            })
+
+    @api.multi
+    def execute(self):
+        """Execute records"""
+        super().execute()
+        self.mapped('target_id').write({'active': False})
+
+
+class EdiActiveSyncRecord(models.AbstractModel):
+    """EDI active synchronizer record
+
+    This is an extension of an EDI synchronizer record to handle the
+    active status of a target record.
+    """
+
+    _edi_sync_deactivator = None
+    """EDI record model for target deactivation records"""
+
+    _name = 'edi.record.sync.active'
+    _inherit = 'edi.record.sync'
+    _description = "EDI Active Synchronizer Record"
+
+    @api.model
+    def target_values(self, record_vals):
+        """Construct target model field value dictionary"""
+        target_vals = super().target_values(record_vals)
+        target_vals.update({
+            'active': True,
+        })
+        return target_vals
+
+    @api.model
+    def matched(self, doc, targets):
+        """Process matched target records"""
+        if self._edi_sync_deactivator is not None:
+            Deactivator = self.env[self._edi_sync_deactivator]
+            unmatched = (targets.search(self._edi_sync_domain()) - targets)
+            Deactivator.prepare(doc, unmatched)

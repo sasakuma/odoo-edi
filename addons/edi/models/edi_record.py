@@ -40,11 +40,13 @@ class EdiLookupRelationship(object):
         self.key = key
         self.target = target
         self.via = via if via else key
-        self.domain = domain if domain else []
+        self.domain = (domain if callable(domain) else
+                       (lambda self: domain) if domain else
+                       (lambda self: []))
 
     def __repr__(self):
-        return '%s(%r, %r, %r %r)' % (self.__class__.__name__, self.key,
-                                      self.target, self.via, self.domain)
+        return '%s(%r, %r, %r)' % (self.__class__.__name__, self.key,
+                                   self.target, self.via)
 
 
 class EdiRecordType(models.Model):
@@ -127,7 +129,7 @@ class EdiRecord(models.AbstractModel):
                 Target = Record[rel.target]
                 targets = Target.search(expression.AND([
                     [(rel.via, 'in', list(set(keygetter(x) for x in batch)))],
-                    rel.domain(Record) if callable(rel.domain) else rel.domain
+                    rel.domain(Record),
                 ]))
                 targets_by_key = {k: v.ensure_one() for k, v in
                                   targets.groupby(rel.via)}
@@ -171,15 +173,15 @@ class EdiRecord(models.AbstractModel):
         for rel in self._edi_relates:
             # pylint: disable=cell-var-from-loop
 
-            # Find values missing a target, if any
-            missing = [x for x in vlist if rel.target not in x]
+            # Find values with a defined key but missing a target, if any
+            missing = [x for x in vlist if rel.key in x and rel.target not in x]
             if not missing:
                 continue
 
             # Search for target records by key
             targets = self.browse()[rel.target].search(expression.AND([
                 [(rel.via, 'in', list(set(x[rel.key] for x in missing)))],
-                rel.domain(Record) if callable(rel.domain) else rel.domain
+                rel.domain(Record),
             ]))
             targets_by_key = {k: v.ensure_one() for k, v in
                               targets.groupby(rel.via)}
@@ -187,8 +189,7 @@ class EdiRecord(models.AbstractModel):
             # Add target values where known
             for vals in missing:
                 target = targets_by_key.get(vals[rel.key])
-                if target:
-                    vals[rel.target] = target.id
+                vals[rel.target] = target.id if target else False
 
     @api.multi
     def execute(self):

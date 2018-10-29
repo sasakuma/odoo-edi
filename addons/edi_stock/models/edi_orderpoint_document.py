@@ -32,7 +32,10 @@ class EdiOrderpointDocument(models.AbstractModel):
 
     @api.model
     def orderpoint_record_model(self, doc, supermodel='edi.orderpoint.record'):
-        """Get EDI minimum inventory rule record model class"""
+        """Get EDI minimum inventory rule record model class
+
+        Subclasses should never need to override this method.
+        """
         return self.record_model(doc, supermodel=supermodel)
 
     @api.model
@@ -43,7 +46,7 @@ class EdiOrderpointDocument(models.AbstractModel):
         passed to :meth:`~odoo.models.Model.create` in order to create
         an EDI minimum inventory rule record.
         """
-        return ()
+        return self.no_record_values()
 
     @api.model
     def prepare(self, doc):

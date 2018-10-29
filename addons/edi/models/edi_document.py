@@ -1,12 +1,15 @@
 """EDI documents"""
 
 from base64 import b64decode, b64encode
+from collections import namedtuple
 import logging
 from odoo import api, fields, models
 from odoo.exceptions import UserError
 from odoo.tools.translate import _
 
 _logger = logging.getLogger(__name__)
+
+AutodetectDocument = namedtuple('AutodetectDocument', ['type', 'inputs'])
 
 
 class IrModel(models.Model):
@@ -18,7 +21,7 @@ class IrModel(models.Model):
                                      help="This is an EDI document model")
 
     def _reflect_model_params(self, model):
-        vals = super(IrModel, self)._reflect_model_params(model)
+        vals = super()._reflect_model_params(model)
         vals['is_edi_document'] = (
             model._name != 'edi.document.model' and
             issubclass(type(model), self.pool['edi.document.model'])
@@ -80,34 +83,39 @@ class EdiDocumentType(models.Model):
             'res_model': 'edi.document',
             'res_field': 'input_ids',
         })
-        docs = Document.browse()
+        input_ids = inputs.ids
+        autodetects = []
         for doc_type in self or self.search([]):
             Model = self.env[doc_type.model_id.model]
             if not hasattr(Model, 'autotype'):
                 continue
             for consume in Model.autotype(inputs):
-                doc = Document.create({'doc_type_id': doc_type.id})
-                consume.write({'res_id': doc.id})
+                autodetects.append(AutodetectDocument(doc_type, consume))
                 inputs -= consume
-                docs += doc
         if inputs:
             if len(self) == 1:
                 doc_type_unknown = self
             else:
                 doc_type_unknown = self.env.ref('edi.document_type_unknown')
-            doc = Document.create({'doc_type_id': doc_type_unknown.id})
-            inputs.write({'res_id': doc.id})
+            autodetects.append(AutodetectDocument(doc_type_unknown, inputs))
+        docs = Document.browse()
+        by_first_input = lambda x: input_ids.index(min(x.inputs.ids))
+        for autodetect in sorted(autodetects, key=by_first_input):
+            doc = Document.create({'doc_type_id': autodetect.type.id})
+            autodetect.inputs.write({'res_id': doc.id})
             docs += doc
         return docs
 
     @api.multi
     def autoemit(self):
-        """Create, prepare, and execute a single document with no inputs"""
-        self.ensure_one()
+        """Create, prepare, and execute documents with no inputs"""
         Document = self.env['edi.document']
-        doc = Document.create({'doc_type_id': self.id})
-        doc.action_execute()
-        return doc
+        docs = Document.browse()
+        for doc_type in self:
+            doc = Document.create({'doc_type_id': doc_type.id})
+            doc.action_execute()
+            docs += doc
+        return docs
 
 
 class EdiDocument(models.Model):
@@ -219,7 +227,7 @@ class EdiDocument(models.Model):
     @api.model
     def create(self, vals):
         """Create record (generating name automatically if needed)"""
-        doc = super(EdiDocument, self).create(vals)
+        doc = super().create(vals)
         if not doc.name:
             doc.name = doc.doc_type_id.sequence_id.next_by_id()
         return doc
@@ -228,7 +236,7 @@ class EdiDocument(models.Model):
     def copy(self, default=None):
         """Duplicate record (including input attachments)"""
         self.ensure_one()
-        new = super(EdiDocument, self).copy(default)
+        new = super().copy(default)
         for attachment in self.input_ids.sorted('id'):
             attachment.copy({
                 'res_id': new.id,
@@ -251,6 +259,14 @@ class EdiDocument(models.Model):
             raise UserError(_("Missing input attachment"))
         return ((x.datas_fname, b64decode(x.datas))
                 for x in self.input_ids.sorted('id'))
+
+    @api.multi
+    def input(self):
+        """Get single decoded input attachment"""
+        self.ensure_one()
+        if len(self.input_ids) > 1:
+            raise UserError(_("More than one input attachment"))
+        return next(self.inputs())
 
     @api.multi
     def output(self, name, data):
@@ -469,5 +485,5 @@ class EdiDocumentUnknown(models.AbstractModel):
     @api.model
     def prepare(self, doc):
         """Prepare document"""
-        super(EdiDocumentUnknown, self).prepare(doc)
+        super().prepare(doc)
         raise UserError(_("Unknown document type"))

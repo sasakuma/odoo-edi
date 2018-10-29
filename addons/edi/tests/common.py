@@ -4,7 +4,6 @@ import base64
 from contextlib import contextmanager
 from datetime import datetime
 import pathlib
-import re
 import sys
 from unittest.mock import patch
 from psycopg2 import DatabaseError
@@ -116,6 +115,16 @@ class EdiCase(common.SavepointCase):
         })
         return attachments
 
+    @classmethod
+    def autoexec(cls, *filenames):
+        """Autocreate and execute input document(s) from attachment(s)"""
+        EdiDocumentType = cls.env['edi.document.type']
+        attachments = cls.create_attachment(*filenames)
+        docs = EdiDocumentType.autocreate(attachments)
+        for doc in docs:
+            doc.action_execute()
+        return docs
+
     def assertAttachment(self, attachment, filename=None, pattern=None):
         """Assert that attachment filename and content is as expected"""
         if filename is None:
@@ -124,7 +133,7 @@ class EdiCase(common.SavepointCase):
         if pattern is None:
             self.assertEqual(attachment.datas_fname, filename)
         else:
-            self.assertTrue(re.match(pattern, attachment.datas_fname))
+            self.assertRegex(attachment.datas_fname, pattern)
         self.assertEqual(base64.b64decode(attachment.datas), data)
 
     @contextmanager
